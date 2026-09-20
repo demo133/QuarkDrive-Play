@@ -13,6 +13,8 @@ import subprocess
 import sys
 import threading
 import time
+import ctypes
+from ctypes import wintypes
 import urllib.parse
 import urllib.request
 import tkinter as tk
@@ -114,6 +116,59 @@ def save_progress(d):
         pass
 
 
+# ---- PotPlayer 进程活动探测（用于区分"播放中 / 暂停 / 已关闭"） ----
+_TH32CS_SNAPPROCESS = 0x2
+
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_wchar * 260)]
+
+
+def _potplayer_cpu_seconds(exe_names):
+    """返回所有匹配进程的累计 CPU 时间(秒)之和；进程不存在返回 None。"""
+    k32 = ctypes.windll.kernel32
+    try:
+        snap = k32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+    except Exception:
+        return None
+    pids = []
+    try:
+        e = _PROCESSENTRY32W()
+        e.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+        ok = k32.Process32FirstW(snap, ctypes.byref(e))
+        while ok:
+            if e.szExeFile.lower() in exe_names:
+                pids.append(e.th32ProcessID)
+            ok = k32.Process32NextW(snap, ctypes.byref(e))
+    finally:
+        k32.CloseHandle(snap)
+    if not pids:
+        return None
+    total = 0.0
+    for pid in pids:
+        h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            continue
+        try:
+            ct, et, kt, ut = (wintypes.FILETIME() for _ in range(4))
+            if k32.GetProcessTimes(h, ctypes.byref(ct), ctypes.byref(et),
+                                   ctypes.byref(kt), ctypes.byref(ut)):
+                for ft in (kt, ut):
+                    total += (((ft.dwHighDateTime << 32) | ft.dwLowDateTime) / 1e7)
+        finally:
+            k32.CloseHandle(h)
+    return total
+
+
 class OpenListClient:
     """OpenList(Alist) API 封装，仅标准库"""
 
@@ -202,7 +257,7 @@ class App:
         self.watch_thread = None
         self.scanning = False
         self.progress = load_progress()
-        self.play_started = None          # {"path","start","at"} 当前播放会话
+        self._sess = None                 # 当前播放会话（结构见 play_item/_progress_loop）
         self._resume_flash_id = None      # 状态栏提示恢复定时器
         self._progress_stop = threading.Event()
         threading.Thread(target=self._progress_loop, daemon=True).start()
@@ -476,26 +531,70 @@ class App:
         return "break"
 
     # ---------------- 播放进度记忆 ----------------
-    def _freeze_session(self):
-        """把当前播放会话的估算位置写入进度库（切换视频/退出时调用）。"""
-        if not self.play_started:
-            return
-        s = self.play_started
-        est = s["start"] + max(0, time.time() - s["at"])
-        self.progress[s["path"]] = {"pos": round(est, 1), "updated": time.time()}
-        self.play_started = None
+    # PotPlayer 是独立进程，拿不到真实进度条位置，因此按"确认在播的时长"推算：
+    #   - 用进程 CPU 时间增量区分 播放中 / 暂停（暂停不计入）
+    #   - 用进程存在性检测播放器关闭（关闭立即冻结，不再累计）
+    #   - 拖动会造成固定偏差，继续观看不会放大；右键「从头播放」可重置
+    def _potplayer_names(self):
+        try:
+            return {os.path.basename(self.cfg.get("potplayer_exe", "")).lower()}
+        except Exception:
+            return {"potplayermini64.exe"}
+
+    def _write_progress(self, s):
+        pos = s["start"] + s["elapsed"]
+        self.progress[s["path"]] = {"pos": round(pos, 1), "updated": time.time()}
         save_progress(self.progress)
 
+    def _freeze_session(self):
+        """切换视频/退出时冻结当前会话：只累计已确认在播的时间。"""
+        s = self._sess
+        if not s:
+            return
+        try:
+            cpu = _potplayer_cpu_seconds(self._potplayer_names())
+            now = time.time()
+            if cpu is not None and s.get("cpu_prev") is not None:
+                d_cpu = max(0.0, cpu - s["cpu_prev"])
+                d_wall = max(0.0, now - s["wall_prev"])
+                if d_wall > 0 and d_cpu / d_wall >= 0.01:
+                    s["elapsed"] += d_wall
+            self._write_progress(s)
+        except Exception:
+            pass
+        self._sess = None
+
     def _progress_loop(self):
-        """每 15 秒把当前会话的估算进度落盘（纯本地计时，不碰视频流）。"""
-        while not self._progress_stop.wait(15):
+        """每 10 秒核对 PotPlayer 状态并更新进度。"""
+        while not self._progress_stop.wait(10):
             try:
-                if not self.play_started or not self.cfg.get("resume_playback", True):
+                s = self._sess
+                if not s or not self.cfg.get("resume_playback", True):
                     continue
-                s = self.play_started
-                est = s["start"] + max(0, time.time() - s["at"])
-                self.progress[s["path"]] = {"pos": round(est, 1), "updated": time.time()}
-                save_progress(self.progress)
+                cpu = _potplayer_cpu_seconds(self._potplayer_names())
+                now = time.time()
+                if cpu is None:
+                    # 播放器已关闭：冻结在最后确认的位置
+                    self._write_progress(s)
+                    self.log("播放器已关闭，进度已保存。")
+                    self._sess = None
+                    continue
+                if s.get("cpu_prev") is None:
+                    s["cpu_prev"], s["wall_prev"] = cpu, now
+                    continue
+                d_cpu = max(0.0, cpu - s["cpu_prev"])
+                d_wall = max(0.0, now - s["wall_prev"])
+                ratio = (d_cpu / d_wall) if d_wall > 0 else 1.0
+                if ratio >= 0.01:
+                    s["elapsed"] += d_wall          # 确认在播
+                    s["low"] = 0
+                else:
+                    # 单次低 CPU 可能是缓冲，连续两个周期低 CPU 才判暂停
+                    s["low"] = s.get("low", 0) + 1
+                    if s["low"] < 2:
+                        s["elapsed"] += d_wall
+                s["cpu_prev"], s["wall_prev"] = cpu, now
+                self._write_progress(s)
             except Exception:
                 pass
 
@@ -562,7 +661,8 @@ class App:
             return
         # 新会话开始，冻结上一会话
         self._freeze_session()
-        self.play_started = {"path": key, "start": pos, "at": time.time()}
+        self._sess = {"path": key, "start": pos, "elapsed": 0.0,
+                      "cpu_prev": None, "wall_prev": time.time()}
         if pos > 0:
             self.log("▶ 已恢复到上次播放位置 %s : %s" % (fmt_pos(pos), item["name"]))
             self.q.put(("resume", {"pos": pos, "name": item["name"]}))
