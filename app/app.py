@@ -25,6 +25,7 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 SEEN_FILE = os.path.join(CONFIG_DIR, "seen.json")
 PLAYLIST_FILE = os.path.join(CONFIG_DIR, "new-videos.m3u")
 SERVICE_LOG = os.path.join(CONFIG_DIR, "service.log")
+PROGRESS_FILE = os.path.join(CONFIG_DIR, "progress.json")
 
 VIDEO_EXT = (".mp4", ".mkv", ".ts", ".m2ts", ".avi", ".mov",
              ".wmv", ".flv", ".webm", ".m4v", ".rmvb")
@@ -41,6 +42,7 @@ DEFAULTS = {
     "poll_seconds": 60,
     "max_depth": 4,
     "autoplay": True,
+    "resume_playback": True,
 }
 
 
@@ -84,6 +86,32 @@ def short_time(s):
     if not s:
         return ""
     return s.replace("T", " ")[:19]
+
+
+def fmt_pos(sec):
+    sec = max(0, int(sec))
+    return "%02d:%02d:%02d" % (sec // 3600, sec % 3600 // 60, sec % 60)
+
+
+def load_progress():
+    """读取播放进度库 {视频路径: {pos, updated}}；损坏/不存在返回空。"""
+    try:
+        with open(PROGRESS_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_progress(d):
+    """原子写入进度库，失败静默（不影响播放）。"""
+    try:
+        tmp = PROGRESS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, PROGRESS_FILE)
+    except Exception:
+        pass
 
 
 class OpenListClient:
@@ -173,6 +201,11 @@ class App:
         self.watch_stop = threading.Event()
         self.watch_thread = None
         self.scanning = False
+        self.progress = load_progress()
+        self.play_started = None          # {"path","start","at"} 当前播放会话
+        self._resume_flash_id = None      # 状态栏提示恢复定时器
+        self._progress_stop = threading.Event()
+        threading.Thread(target=self._progress_loop, daemon=True).start()
 
         root.title("%s v%s - 夸克网盘边下边播" % (APP_NAME, APP_VER))
         root.geometry("880x620")
@@ -219,13 +252,13 @@ class App:
 
         frame = ttk.Frame(tab1)
         frame.pack(fill="both", expand=True, padx=8, pady=4)
-        cols = ("name", "size", "mtime", "dir")
+        cols = ("name", "size", "mtime", "prog")
         self.tree = ttk.Treeview(frame, columns=cols, show="headings")
         for cid, txt, w, anchor in (
                 ("name", "文件名", 300, "w"),
                 ("size", "大小", 90, "e"),
                 ("mtime", "修改时间", 150, "center"),
-                ("dir", "所在目录", 220, "w")):
+                ("prog", "上次看到", 110, "center")):
             self.tree.heading(cid, text=txt)
             self.tree.column(cid, width=w, anchor=anchor)
         vs = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
@@ -233,6 +266,14 @@ class App:
         self.tree.pack(side="left", fill="both", expand=True)
         vs.pack(side="right", fill="y")
         self.tree.bind("<Double-1>", self.on_play)
+        self.tree.bind("<Button-3>", self.on_tree_menu)
+
+        # 右键菜单：续播 / 从头播放 / 清除进度
+        self.menu = tk.Menu(self.root, tearoff=0)
+        self.menu.add_command(label="▶ 播放（自动续播）", command=lambda: self._menu_action("play"))
+        self.menu.add_command(label="⏮ 从头播放", command=lambda: self._menu_action("restart"))
+        self.menu.add_separator()
+        self.menu.add_command(label="✕ 清除本片进度记录", command=lambda: self._menu_action("clear"))
 
         self.lbl_stat = ttk.Label(tab1, text="共 0 个视频 · 双击任意一行即可调用 PotPlayer 播放")
         self.lbl_stat.pack(fill="x", padx=10, pady=(0, 6))
@@ -272,10 +313,14 @@ class App:
         ttk.Checkbutton(tab2, text="发现新视频时自动播放",
                         variable=self.chk_auto_cfg).grid(
             row=len(rows), column=1, sticky="w", pady=8)
+        self.chk_resume_cfg = tk.BooleanVar(value=bool(self.cfg.get("resume_playback", True)))
+        ttk.Checkbutton(tab2, text="记住播放进度（打开同一视频自动续播）",
+                        variable=self.chk_resume_cfg).grid(
+            row=len(rows) + 1, column=1, sticky="w", pady=2)
         ttk.Button(tab2, text="保存设置", command=self.save_settings).grid(
-            row=len(rows) + 1, column=1, sticky="w", pady=6)
+            row=len(rows) + 2, column=1, sticky="w", pady=6)
         ttk.Label(tab2, text="配置与数据目录: " + CONFIG_DIR, foreground="#666").grid(
-            row=len(rows) + 2, column=0, columnspan=3, sticky="w", padx=14, pady=10)
+            row=len(rows) + 3, column=0, columnspan=3, sticky="w", padx=14, pady=10)
 
         # ---- Tab 3: 日志 ----
         tab3 = ttk.Frame(nb)
@@ -302,6 +347,7 @@ class App:
             e.delete(0, "end")
             e.insert(0, str(v))
         self.chk_auto_cfg.set(bool(self.cfg.get("autoplay", True)))
+        self.chk_resume_cfg.set(bool(self.cfg.get("resume_playback", True)))
         self.log("欢迎使用 %s v%s" % (APP_NAME, APP_VER))
         self.log("配置目录: " + CONFIG_DIR)
         self.log("提示：先点「启动 OpenList」(或确认服务已运行)，再点「立即扫描」。")
@@ -323,6 +369,7 @@ class App:
                     v = int(DEFAULTS[k])
             cfg[k] = v
         cfg["autoplay"] = bool(self.chk_auto_cfg.get())
+        cfg["resume_playback"] = bool(self.chk_resume_cfg.get())
         return cfg
 
     def save_settings(self):
@@ -417,18 +464,111 @@ class App:
         item = self.items[int(sel[0])]
         self.play_item(item)
 
-    def play_item(self, item):
+    def on_tree_menu(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        self.tree.selection_set(iid)
+        try:
+            self.menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.menu.grab_release()
+        return "break"
+
+    # ---------------- 播放进度记忆 ----------------
+    def _freeze_session(self):
+        """把当前播放会话的估算位置写入进度库（切换视频/退出时调用）。"""
+        if not self.play_started:
+            return
+        s = self.play_started
+        est = s["start"] + max(0, time.time() - s["at"])
+        self.progress[s["path"]] = {"pos": round(est, 1), "updated": time.time()}
+        self.play_started = None
+        save_progress(self.progress)
+
+    def _progress_loop(self):
+        """每 15 秒把当前会话的估算进度落盘（纯本地计时，不碰视频流）。"""
+        while not self._progress_stop.wait(15):
+            try:
+                if not self.play_started or not self.cfg.get("resume_playback", True):
+                    continue
+                s = self.play_started
+                est = s["start"] + max(0, time.time() - s["at"])
+                self.progress[s["path"]] = {"pos": round(est, 1), "updated": time.time()}
+                save_progress(self.progress)
+            except Exception:
+                pass
+
+    def _menu_action(self, action):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        item = self.items[int(sel[0])]
+        if action == "play":
+            self.play_item(item)
+        elif action == "restart":
+            self.progress.pop(item["path"], None)
+            save_progress(self.progress)
+            self._refresh_row_progress(item["path"])
+            self.log("已清除进度，从头播放: %s" % item["name"])
+            self.play_item(item, force_restart=True)
+        elif action == "clear":
+            self.progress.pop(item["path"], None)
+            save_progress(self.progress)
+            self._refresh_row_progress(item["path"])
+            self.log("已清除进度记录: %s" % item["name"])
+
+    def _refresh_row_progress(self, path):
+        for i, it in enumerate(self.items):
+            if it["path"] == path:
+                rec = self.progress.get(path) or {}
+                pos = float(rec.get("pos") or 0)
+                val = fmt_pos(pos) if pos >= 5 else ""
+                try:
+                    self.tree.set(str(i), "prog", val)
+                except Exception:
+                    pass
+                break
+
+    def play_item(self, item, force_restart=False):
         exe = self.cfg.get("potplayer_exe", "")
         if not os.path.exists(exe):
             self.log("找不到 PotPlayer: %s ，请到「设置」修改路径。" % exe)
             messagebox.showwarning(APP_NAME, "找不到 PotPlayer：\n%s\n请到「设置」修改路径。" % exe)
             return
         url = OpenListClient(self.cfg).play_url(item)
+        key = item["path"]
+        resume_on = bool(self.cfg.get("resume_playback", True))
+        pos = 0.0
+        if force_restart:
+            self.progress.pop(key, None)
+            save_progress(self.progress)
+            self._refresh_row_progress(key)
+        elif resume_on:
+            try:
+                pos = float((self.progress.get(key) or {}).get("pos") or 0)
+            except Exception:
+                pos = 0.0
+        if pos < 5:            # 无记录/几乎没看/手动重头 → 从头
+            pos = 0.0
+        args = [exe]
+        if pos > 0:
+            args.append("/seek=" + fmt_pos(pos))
+        args.append(url)
         try:
-            subprocess.Popen([exe, url], creationflags=CREATE_NO_WINDOW)
-            self.log("已调用 PotPlayer 播放: %s" % item["name"])
+            subprocess.Popen(args, creationflags=CREATE_NO_WINDOW)
         except Exception as e:
             self.log("播放失败: %s" % e)
+            return
+        # 新会话开始，冻结上一会话
+        self._freeze_session()
+        self.play_started = {"path": key, "start": pos, "at": time.time()}
+        if pos > 0:
+            self.log("▶ 已恢复到上次播放位置 %s : %s" % (fmt_pos(pos), item["name"]))
+            self.q.put(("resume", {"pos": pos, "name": item["name"]}))
+        else:
+            self.log("已调用 PotPlayer 播放: %s" % item["name"])
+            self._refresh_row_progress(key)
 
     # ---------------- OpenList 服务 ----------------
     def svc_toggle(self):
@@ -568,6 +708,18 @@ class App:
                     if data is not None:
                         self.lbl_stat.configure(
                             text="共 %d 个视频 · 双击任意一行即可调用 PotPlayer 播放" % data)
+                elif kind == "resume":
+                    msg = "▶ 已恢复到上次播放位置 %s · %s" % (fmt_pos(data["pos"]), data["name"])
+                    if self._resume_flash_id:
+                        try:
+                            self.root.after_cancel(self._resume_flash_id)
+                        except Exception:
+                            pass
+                    self.lbl_stat.configure(text=msg, foreground="#f26614")
+                    self._resume_flash_id = self.root.after(
+                        8000, lambda: self.lbl_stat.configure(
+                            text="共 %d 个视频 · 双击任意一行即可调用 PotPlayer 播放" % len(self.items),
+                            foreground="#000000"))
                 elif kind == "scan_request":
                     self.start_scan()
                 elif kind == "svc_done":
@@ -592,14 +744,20 @@ class App:
         self.items = sorted(items, key=lambda x: x["mtime"], reverse=True)
         self.tree.delete(*self.tree.get_children())
         for i, it in enumerate(self.items):
-            parent = os.path.dirname(it["path"])
-            parent = parent.rsplit("/", 1)[-1] or "/"
+            rec = self.progress.get(it["path"]) or {}
+            try:
+                pos = float(rec.get("pos") or 0)
+            except Exception:
+                pos = 0.0
+            prog = fmt_pos(pos) if pos >= 5 else ""
             self.tree.insert("", "end", iid=str(i), values=(
                 it["name"], human_size(it["size"]),
-                short_time(it["mtime"]), parent))
+                short_time(it["mtime"]), prog))
 
     def on_close(self):
         self.watch_stop.set()
+        self._progress_stop.set()
+        self._freeze_session()   # 保存播放进度
         if self.svc_proc and self.svc_proc.poll() is None:
             ans = messagebox.askyesnocancel(
                 APP_NAME,
