@@ -565,8 +565,8 @@ class App:
         self._sess = None
 
     def _progress_loop(self):
-        """每 10 秒核对 PotPlayer 状态并更新进度。"""
-        while not self._progress_stop.wait(10):
+        """每 3 秒核对 PotPlayer 状态并更新进度（暂停响应 ≤3 秒）。"""
+        while not self._progress_stop.wait(3):
             try:
                 s = self._sess
                 if not s or not self.cfg.get("resume_playback", True):
@@ -585,14 +585,16 @@ class App:
                 d_cpu = max(0.0, cpu - s["cpu_prev"])
                 d_wall = max(0.0, now - s["wall_prev"])
                 ratio = (d_cpu / d_wall) if d_wall > 0 else 1.0
-                if ratio >= 0.01:
-                    s["elapsed"] += d_wall          # 确认在播
-                    s["low"] = 0
-                else:
-                    # 单次低 CPU 可能是缓冲，连续两个周期低 CPU 才判暂停
-                    s["low"] = s.get("low", 0) + 1
-                    if s["low"] < 2:
-                        s["elapsed"] += d_wall
+                # 自适应阈值：max(0.6%, 最近播放采样的 30%)——兼容硬解低 CPU，
+                # 暂停(CPU趋近0)总会低于该线
+                hist = s.get("ratios") or []
+                med = sorted(hist)[len(hist) // 2] if hist else 0.02
+                threshold = max(0.006, med * 0.3)
+                if ratio >= threshold:
+                    s["elapsed"] += d_wall
+                    hist.append(ratio)
+                    s["ratios"] = hist[-5:]
+                # 否则视为暂停，不计入（单周期即响应，误差 ≤3 秒）
                 s["cpu_prev"], s["wall_prev"] = cpu, now
                 self._write_progress(s)
             except Exception:
@@ -662,7 +664,7 @@ class App:
         # 新会话开始，冻结上一会话
         self._freeze_session()
         self._sess = {"path": key, "start": pos, "elapsed": 0.0,
-                      "cpu_prev": None, "wall_prev": time.time()}
+                      "cpu_prev": None, "wall_prev": time.time(), "ratios": []}
         if pos > 0:
             self.log("▶ 已恢复到上次播放位置 %s : %s" % (fmt_pos(pos), item["name"]))
             self.q.put(("resume", {"pos": pos, "name": item["name"]}))
