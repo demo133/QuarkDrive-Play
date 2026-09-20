@@ -9,12 +9,15 @@ QuarkPlay - 夸克网盘(OpenList) x PotPlayer 边下边播 图形客户端
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
 import time
 import ctypes
+import uuid
 from ctypes import wintypes
+import urllib.error
 import urllib.parse
 import urllib.request
 import tkinter as tk
@@ -169,6 +172,106 @@ def _potplayer_cpu_seconds(exe_names):
     return total
 
 
+class _RangeProxy:
+    """本地字节级回源代理（仅标准库）。
+
+    PotPlayer 播放的是 http://127.0.0.1:<port>/p/<token>，代理把 Range 请求
+    原样转发给 OpenList 直链并流式回传，同时把每个请求的起始字节上报给
+    回调 on_range(token, offset, size) —— 拖动进度条时 PotPlayer 会发出
+    一个跳变的新 Range 请求，由此当场识别拖动位置；顺序读到片尾则识别为看完。
+    不落盘、不缓存，只做透明转发。
+    """
+
+    def __init__(self, on_range):
+        self.on_range = on_range      # fn(token, offset, size)
+        self.streams = {}             # token -> {"url": 直链, "size": 字节, "refresh": fn}
+        self.port = None
+        self._httpd = None
+
+    def start(self):
+        from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+        proxy = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, fmt, *args):
+                pass
+
+            def do_GET(self):
+                token = ""
+                try:
+                    token = self.path.split("/p/", 1)[1].split("/")[0].split("?")[0]
+                except Exception:
+                    pass
+                st = proxy.streams.get(token)
+                if not st:
+                    self.send_error(404)
+                    return
+                rng = self.headers.get("Range")
+                offset = 0
+                if rng:
+                    m = re.match(r"bytes=(\d+)-", rng.strip())
+                    if m:
+                        offset = int(m.group(1))
+                try:
+                    proxy.on_range(token, offset, st.get("size") or 0)
+                except Exception:
+                    pass
+                up = None
+                for attempt in (1, 2):
+                    try:
+                        req = urllib.request.Request(st["url"])
+                        if rng:
+                            req.add_header("Range", rng)
+                        req.add_header(
+                            "User-Agent",
+                            self.headers.get("User-Agent") or "QuarkPlay/1.0")
+                        up = urllib.request.urlopen(req, timeout=60)
+                        break
+                    except urllib.error.HTTPError as e:
+                        if attempt == 1 and e.code in (401, 403, 404):
+                            try:      # 直链可能过期，刷新一次再试
+                                st["url"] = st["refresh"]() or st["url"]
+                            except Exception:
+                                pass
+                            continue
+                        self.send_error(502)
+                        return
+                    except Exception:
+                        self.send_error(502)
+                        return
+                if up is None:
+                    return
+                try:
+                    self.send_response(up.status)
+                    for h in ("Content-Range", "Content-Length", "Content-Type",
+                              "Accept-Ranges", "Content-Disposition"):
+                        v = up.headers.get(h)
+                        if v:
+                            self.send_header(h, v)
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.close_connection = True
+                    while True:
+                        chunk = up.read(262144)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                except Exception:
+                    pass                # 客户端中断（暂停/拖动/关闭）属正常
+                finally:
+                    try:
+                        up.close()
+                    except Exception:
+                        pass
+
+        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._httpd.daemon_threads = True
+        self.port = self._httpd.server_address[1]
+        threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
+
+
 class OpenListClient:
     """OpenList(Alist) API 封装，仅标准库"""
 
@@ -261,6 +364,8 @@ class App:
         self._resume_flash_id = None      # 状态栏提示恢复定时器
         self._progress_stop = threading.Event()
         threading.Thread(target=self._progress_loop, daemon=True).start()
+        self._proxy = None
+        self._start_proxy()
 
         root.title("%s v%s - 夸克网盘边下边播" % (APP_NAME, APP_VER))
         root.geometry("880x620")
@@ -531,10 +636,21 @@ class App:
         return "break"
 
     # ---------------- 播放进度记忆 ----------------
-    # PotPlayer 是独立进程，拿不到真实进度条位置，因此按"确认在播的时长"推算：
-    #   - 用进程 CPU 时间增量区分 播放中 / 暂停（暂停不计入）
-    #   - 用进程存在性检测播放器关闭（关闭立即冻结，不再累计）
-    #   - 拖动会造成固定偏差，继续观看不会放大；右键「从头播放」可重置
+    # 双信号融合：
+    #   1) CPU 活动探测 —— 区分 播放中 / 暂停（暂停不计入）/ 播放器已关闭；
+    #   2) 本地字节级代理 —— PotPlayer 的每次 Range 请求都经过代理，拖动
+    #      进度条会触发一个跳变的新请求，当场换算成时间位置记录下来。
+    # 码率(bytes/播放秒)在观看过程中持续校准并按片保存，拖动换算越来越准。
+    def _start_proxy(self):
+        try:
+            p = _RangeProxy(self._on_range)
+            p.start()
+            self._proxy = p
+            self.log("本地播放代理已就绪 (127.0.0.1:%d)，拖动进度条也会被记录。" % p.port)
+        except Exception as e:
+            self._proxy = None
+            self.log("本地播放代理启动失败(%s)，将用直链播放（拖动进度无法记录）。" % e)
+
     def _potplayer_names(self):
         try:
             return {os.path.basename(self.cfg.get("potplayer_exe", "")).lower()}
@@ -543,8 +659,68 @@ class App:
 
     def _write_progress(self, s):
         pos = s["start"] + s["elapsed"]
-        self.progress[s["path"]] = {"pos": round(pos, 1), "updated": time.time()}
+        self.progress[s["path"]] = {"pos": round(pos, 1),
+                                    "bitrate": round(s.get("bitrate") or 0, 1),
+                                    "updated": time.time()}
         save_progress(self.progress)
+
+    def _on_range(self, token, offset, size):
+        """代理线程回调：PotPlayer 请求了文件第 offset 字节。"""
+        with self.lock:
+            s = self._sess
+            if not s or not token or s.get("token") != token:
+                return
+            if not self.cfg.get("resume_playback", True):
+                return
+            prev = s.get("byte")
+            s["byte"] = offset
+            fsize = size or s.get("size") or 0
+            if s.get("seg_byte0") is None:
+                s["seg_byte0"] = offset
+                s["seg_sec0"] = s["start"]
+                return
+            in_tail = bool(fsize) and offset > fsize * 0.98
+            if time.time() - s.get("t0", time.time()) < 10:
+                # 会话前 10 秒内的跳转 = 探测/索引读取/seek 落点，只重新锚定
+                if not in_tail:
+                    s["seg_byte0"] = offset
+                    s["seg_sec0"] = s["start"] + s["elapsed"]
+                return
+            if in_tail:
+                return
+            # 顺序读到 97% 以后 → 判定看完，记录清零（下次从头播放）
+            if (fsize and offset >= fsize * 0.97 and prev is not None
+                    and 0 <= offset - prev <= 8 * 1024 * 1024
+                    and s.get("elapsed", 0) > 60):
+                s["start"], s["elapsed"] = 0.0, 0.0
+                self._write_progress(s)
+                self.log("本片已播完，进度记录已清零。")
+                return
+            jump = abs(offset - prev) if prev is not None else 0
+            if prev is None or jump <= max(2 * 1024 * 1024, fsize * 0.01):
+                return                      # 顺序播放，不动锚点
+            # —— 拖动进度条 ——
+            b0 = s.get("seg_byte0")
+            bitrate = s.get("bitrate") or 0.0
+            if bitrate <= 0 and b0 is not None and prev > b0 and s.get("elapsed", 0) >= 15:
+                bitrate = (prev - b0) / s["elapsed"]
+            if bitrate <= 0 and fsize:
+                bitrate = fsize / 5400.0    # 兜底：按 90 分钟估算
+            if bitrate > 0 and b0 is not None:
+                new_pos = s.get("seg_sec0", s["start"]) + (offset - b0) / bitrate
+            else:
+                new_pos = s["start"] + s["elapsed"]
+            new_pos = max(0.0, new_pos)
+            s["start"] = new_pos
+            s["elapsed"] = 0.0
+            s["seg_byte0"] = offset
+            s["seg_sec0"] = new_pos
+            s["cpu_prev"] = None
+            s["wall_prev"] = time.time()
+            s["ratios"] = []
+            self._write_progress(s)
+            self.log("检测到拖动进度条 → 已记录位置 %s" % fmt_pos(new_pos))
+            self.q.put(("seeked", {"pos": new_pos, "name": s.get("name", "")}))
 
     def _freeze_session(self):
         """切换视频/退出时冻结当前会话：只累计已确认在播的时间。"""
@@ -594,6 +770,12 @@ class App:
                     s["elapsed"] += d_wall
                     hist.append(ratio)
                     s["ratios"] = hist[-5:]
+                    # 用 字节增量 ÷ 确认播放时长 持续校准码率（拖动换算用）
+                    b0, by = s.get("seg_byte0"), s.get("byte")
+                    if b0 is not None and by and by > b0 and s["elapsed"] >= 15:
+                        inst = (by - b0) / s["elapsed"]
+                        s["bitrate"] = (s["bitrate"] * 0.7 + inst * 0.3
+                                        if s.get("bitrate") else inst)
                 # 否则视为暂停，不计入（单周期即响应，误差 ≤3 秒）
                 s["cpu_prev"], s["wall_prev"] = cpu, now
                 self._write_progress(s)
@@ -652,6 +834,25 @@ class App:
                 pos = 0.0
         if pos < 5:            # 无记录/几乎没看/手动重头 → 从头
             pos = 0.0
+        try:
+            br = float((self.progress.get(key) or {}).get("bitrate") or 0)
+        except Exception:
+            br = 0.0
+        # 播放地址走本地代理：程序能看到 PotPlayer 实际读到的字节位置，
+        # 拖动进度条 / 播完才能被识别；代理不可用时自动退回直链。
+        token = None
+        if self._proxy and self._proxy.port:
+            try:
+                self._proxy.streams.clear()
+                token = uuid.uuid4().hex[:16]
+                self._proxy.streams[token] = {
+                    "url": url,
+                    "size": int(item.get("size") or 0),
+                    "refresh": lambda it=item: OpenListClient(self.cfg).play_url(it),
+                }
+                url = "http://127.0.0.1:%d/p/%s" % (self._proxy.port, token)
+            except Exception:
+                token = None
         args = [exe]
         if pos > 0:
             args.append("/seek=" + fmt_pos(pos))
@@ -664,7 +865,11 @@ class App:
         # 新会话开始，冻结上一会话
         self._freeze_session()
         self._sess = {"path": key, "start": pos, "elapsed": 0.0,
-                      "cpu_prev": None, "wall_prev": time.time(), "ratios": []}
+                      "cpu_prev": None, "wall_prev": time.time(), "ratios": [],
+                      "token": token, "name": item["name"],
+                      "size": int(item.get("size") or 0),
+                      "byte": None, "seg_byte0": None, "seg_sec0": pos,
+                      "bitrate": br, "t0": time.time()}
         if pos > 0:
             self.log("▶ 已恢复到上次播放位置 %s : %s" % (fmt_pos(pos), item["name"]))
             self.q.put(("resume", {"pos": pos, "name": item["name"]}))
@@ -811,17 +1016,11 @@ class App:
                         self.lbl_stat.configure(
                             text="共 %d 个视频 · 双击任意一行即可调用 PotPlayer 播放" % data)
                 elif kind == "resume":
-                    msg = "▶ 已恢复到上次播放位置 %s · %s" % (fmt_pos(data["pos"]), data["name"])
-                    if self._resume_flash_id:
-                        try:
-                            self.root.after_cancel(self._resume_flash_id)
-                        except Exception:
-                            pass
-                    self.lbl_stat.configure(text=msg, foreground="#f26614")
-                    self._resume_flash_id = self.root.after(
-                        8000, lambda: self.lbl_stat.configure(
-                            text="共 %d 个视频 · 双击任意一行即可调用 PotPlayer 播放" % len(self.items),
-                            foreground="#000000"))
+                    self._flash_status("▶ 已恢复到上次播放位置 %s · %s" % (
+                        fmt_pos(data["pos"]), data["name"]))
+                elif kind == "seeked":
+                    self._flash_status("↔ 已记录拖动后的位置 %s · %s" % (
+                        fmt_pos(data["pos"]), data["name"]))
                 elif kind == "scan_request":
                     self.start_scan()
                 elif kind == "svc_done":
@@ -841,6 +1040,19 @@ class App:
         except queue.Empty:
             pass
         self.root.after(100, self._drain)
+
+    def _flash_status(self, msg):
+        """状态栏橙色提示 8 秒后复原（恢复/拖动记录共用）。"""
+        if self._resume_flash_id:
+            try:
+                self.root.after_cancel(self._resume_flash_id)
+            except Exception:
+                pass
+        self.lbl_stat.configure(text=msg, foreground="#f26614")
+        self._resume_flash_id = self.root.after(
+            8000, lambda: self.lbl_stat.configure(
+                text="共 %d 个视频 · 双击任意一行即可调用 PotPlayer 播放" % len(self.items),
+                foreground="#000000"))
 
     def _fill_tree(self, items):
         self.items = sorted(items, key=lambda x: x["mtime"], reverse=True)
