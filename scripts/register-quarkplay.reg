@@ -1,0 +1,12 @@
+Windows Registry Editor Version 5.00
+
+; Registers the "quarkplay:" protocol for the current user (no admin needed).
+; Double-click this .reg file and confirm.
+; If you move the scripts folder, edit the path below to point to play-url.bat.
+
+[HKEY_CURRENT_USER\Software\Classes\quarkplay]
+@="URL:QuarkPlay Protocol"
+"URL Protocol"=""
+
+[HKEY_CURRENT_USER\Software\Classes\quarkplay\shell\open\command]
+@="\"C:\\quark-potplayer\\scripts\\play-url.bat\" \"%1\""

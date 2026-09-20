@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>夸克网盘 × PotPlayer 边下边播 · 完整方案</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1d212b; --line:#2a2f3c;
+    --txt:#d8dde6; --sub:#8b93a3; --acc:#4da3ff; --ok:#3fbf7f; --warn:#e6b455; --bad:#e06c6c;
+    --code:#12151c;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);font:15px/1.75 "Segoe UI","Microsoft YaHei",sans-serif;}
+  .wrap{max-width:880px;margin:0 auto;padding:40px 24px 80px;}
+  h1{font-size:26px;margin:0 0 6px;}
+  h2{font-size:20px;margin:44px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line);color:#fff;}
+  h3{font-size:16px;margin:26px 0 10px;color:#eaf0fa;}
+  p{margin:10px 0;}
+  .meta{color:var(--sub);font-size:13px;margin-bottom:24px;}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13.5px;}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top;}
+  th{background:var(--panel2);color:#cfe0ff;font-weight:600;white-space:nowrap;}
+  tr:nth-child(even) td{background:#151822;}
+  code,pre{font-family:Consolas,"JetBrains Mono",monospace;font-size:13px;}
+  code{background:var(--code);border:1px solid var(--line);border-radius:4px;padding:1px 6px;color:#9fd0ff;}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:8px;padding:14px 16px;overflow-x:auto;line-height:1.6;margin:12px 0;}
+  pre code{background:none;border:none;padding:0;color:#c9e3ff;white-space:pre;}
+  .box{border-radius:10px;padding:14px 18px;margin:16px 0;font-size:14px;}
+  .box b:first-child{display:inline-block;margin-bottom:2px;}
+  .tldr{background:linear-gradient(135deg,#14243d,#101a2c);border:1px solid #2b4a77;}
+  .okbox{background:#12231c;border:1px solid #2b5c43;}
+  .warnbox{background:#2a2113;border:1px solid #6b5320;}
+  .badbox{background:#2a1616;border:1px solid #6b2b2b;}
+  .tag{display:inline-block;font-size:12px;border-radius:20px;padding:1px 10px;margin-left:8px;vertical-align:2px;}
+  .tag.rec{background:#153a29;color:#5fe0a1;border:1px solid #2b5c43;}
+  .tag.opt{background:#1c2a44;color:#8fbaff;border:1px solid #2b4a77;}
+  .tag.pay{background:#3a2f14;color:#e6c377;border:1px solid #6b5320;}
+  .step{display:flex;gap:12px;margin:14px 0;align-items:flex-start;}
+  .step .n{flex:0 0 26px;height:26px;border-radius:50%;background:var(--acc);color:#0b1220;font-weight:700;display:flex;align-items:center;justify-content:center;font-size:13px;margin-top:3px;}
+  ul{margin:8px 0;padding-left:22px;}
+  li{margin:5px 0;}
+  .muted{color:var(--sub);font-size:13px;}
+  .kbd{background:#0c0f14;border:1px solid #3a4152;border-bottom-width:2px;border-radius:4px;padding:0 6px;font-size:12.5px;}
+  a{color:var(--acc);text-decoration:none;}
+  a:hover{text-decoration:underline;}
+  .foot{margin-top:60px;color:var(--sub);font-size:12.5px;border-top:1px solid var(--line);padding-top:16px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>夸克网盘 × PotPlayer「边下边播」完整方案</h1>
+<div class="meta">适用：Windows 10/11 · PotPlayer · 夸克网盘（SVIP） · 2026-09</div>
+
+<div class="box tldr">
+<b>一句话结论</b><br>
+夸克官方<b>不提供 WebDAV</b>，想用 PotPlayer 边下边播必须靠第三方桥接。<b>最省事且免费的主路线：OpenList（Alist 社区版）拿直链 → PotPlayer 直接播 URL</b>；想在资源管理器里<b>双击就播</b>，再叠加 rclone 挂载成 Z: 盘；完全不想碰命令行，就选付费的 <b>CloudDrive2</b>。
+</div>
+
+<h2>① 三种实现方式对比</h2>
+<table>
+<tr><th>方案</th><th>原理</th><th>双击播放</th><th>成本</th><th>优点</th><th>缺点</th></tr>
+<tr><td><b>A. OpenList 直链 + PotPlayer 播 URL</b><span class="tag rec">推荐起步</span></td>
+<td>OpenList 把夸克转成 HTTP 直链（302 到夸克 CDN），PotPlayer 打开 URL 流式播放</td>
+<td>✘（靠脚本/协议代劳）</td><td>免费开源</td>
+<td>10 分钟跑通；不占本地磁盘；直链走 CDN 满速；一条命令即可自动化</td>
+<td>资源管理器里没有实体文件；外挂字幕要手动载入</td></tr>
+<tr><td><b>B. OpenList + rclone 挂载盘符</b><span class="tag opt">要双击就加</span></td>
+<td>rclone 通过 WebDAV 把 OpenList 挂成 Z: 盘</td>
+<td>✔ 原生双击</td><td>免费开源</td>
+<td>双击即播、字幕同名自动加载、可当普通盘用</td>
+<td>多装两个组件（WinFsp + rclone）；缓存占磁盘；seek 首次略慢</td></tr>
+<tr><td><b>C. CloudDrive2</b><span class="tag pay">付费</span></td>
+<td>商业软件内置夸克驱动，直接挂盘符</td>
+<td>✔ 原生双击</td><td>订阅制（价格以官网为准）</td>
+<td>图形界面全自动，最省事；还能做 WebDAV 服务器</td>
+<td>要钱；闭源</td></tr>
+<tr><td>D. 夸克官方客户端「在线播放」</td>
+<td>夸克自家播放器，转码流</td>
+<td>✘</td><td>免费</td>
+<td>零配置、不折腾</td>
+<td>不能用 PotPlayer、不能选外挂解码、清晰度受限于转码</td></tr>
+</table>
+<p class="muted">推荐路径：先做 A（验证链路 + 日常“丢个链接就能看”），顺手把 B 的挂载配上（双击体验）。C 仅在你完全不想碰命令行时选。</p>
+
+<div class="box badbox">
+<b>⚠️ 合规与账号风险（必读）</b><br>
+夸克用户协议禁止“自动化访问及非授权集成”。OpenList/CD2 都是通过网页版 Cookie 模拟登录实现的第三方接入，<b>存在 Cookie 失效、接口变动、极端情况下账号风控的风险</b>。降低风险的用法：仅本机自用、避免高频轮询大目录、不要分享挂载服务给别人用。本方案的所有扫描都带了节流参数。
+</div>
+
+<h2>② 方案 A：OpenList 直链 + PotPlayer（主线，约 10 分钟）</h2>
+
+<h3>A-1. 安装 OpenList</h3>
+<div class="step"><div class="n">1</div><div>
+下载 Windows 版：<a href="https://github.com/OpenListTeam/OpenList/releases">github.com/OpenListTeam/OpenList/releases</a> →
+<code>openlist-windows-amd64.zip</code>，解压到如 <code>C:\openlist</code>。
+</div></div>
+<div class="step"><div class="n">2</div><div>
+在该目录打开终端，启动服务并设置管理员密码：
+<pre><code>cd /d C:\openlist
+openlist server          :: 前台运行，保持窗口开着；首次会初始化数据
+:: 另开一个终端窗口：
+openlist admin set 你的密码</code></pre>
+浏览器打开 <code>http://127.0.0.1:5244</code>，用 <code>admin / 你刚设的密码</code> 登录。
+</div></div>
+
+<h3>A-2. 添加夸克网盘存储</h3>
+<div class="step"><div class="n">3</div><div>
+网页：<b>管理 → 存储 → 添加</b>，按下表填写：
+<table>
+<tr><th>字段</th><th>填什么</th><th>说明</th></tr>
+<tr><td>驱动</td><td><b>夸克（Quark）</b></td><td>—</td></tr>
+<tr><td>挂载路径</td><td><code>/quark</code></td><td>自定义，后面脚本默认按它写，改了要同步改 <code>config.ps1</code></td></tr>
+<tr><td>Cookie</td><td>见下方获取方法</td><td>核心凭据</td></tr>
+<tr><td>根文件夹 ID</td><td><code>0</code></td><td>挂整个网盘；只挂某文件夹就填地址栏里那串 id</td></tr>
+<tr><td>启用签名</td><td><b>关闭</b>（仅本机自用）</td><td>关掉后直链不带 sign，PotPlayer/协议/双击才能直接播；若要暴露到局域网请开启并只用脚本生成的链接</td></tr>
+<tr><td>Web 代理 / 直链策略</td><td>优先 <b>302 重定向</b>（不勾“Web 代理”）</td><td>302 = 播放器直连夸克 CDN，不吃本机带宽；“本地代理”只在 302 失败时兜底</td></tr>
+</table>
+</div></div>
+<div class="step"><div class="n">4</div><div>
+<b>获取 Cookie</b>：Edge/Chrome 打开 <a href="https://pan.quark.cn/list">pan.quark.cn</a> 并登录 → 按 <span class="kbd">F12</span> →
+「网络/Network」标签 → 刷新页面 → 随便点一个请求（如 <code>system_path?pr=ucpro</code> 开头）→
+「请求标头」里复制<b>完整的 <code>cookie:</code> 值</b> → 粘贴到存储配置的 Cookie 框 → 保存。
+状态显示 <code>work</code> 即成功。
+</div></div>
+<div class="step"><div class="n">5</div><div>
+<b>验证直链</b>：回到首页点进夸克 → 找一个视频 → 右键「复制链接-下载链接」，得到形如
+<code>http://127.0.0.1:5244/d/quark/电影/xxx.mkv?sign=…</code> 的地址。
+<b>注意：/d/ 后面必须带挂载路径</b>（本例即 <code>/d/quark/…</code>），少了一级会 401。
+</div></div>
+
+<h3>A-3. PotPlayer 配置</h3>
+<div class="step"><div class="n">6</div><div>
+<b>播放直链</b>：PotPlayer 主界面右键 → <b>打开 URL</b>（<span class="kbd">Ctrl+U</span>）→ 粘贴直链 → 播放。
+或命令行：<code>PotPlayerMini64.exe "http://127.0.0.1:5244/d/quark/电影/xxx.mkv?sign=…"</code>
+</div></div>
+<div class="step"><div class="n">7</div><div>
+<b>网络缓冲调大</b>（边下边播顺滑的关键，按 <span class="kbd">F5</span> 进选项）：
+<table>
+<tr><th>位置</th><th>设置</th><th>建议值</th></tr>
+<tr><td>滤镜 → 源滤镜/分离器</td><td>文件/流缓存</td><td>512～1024 MB（内存 8G+ 再开这么大）</td></tr>
+<tr><td>网络</td><td>网络流缓冲时间</td><td>默认 5000ms → 10000～15000ms</td></tr>
+<tr><td>视频 → 视频渲染器</td><td>硬解</td><td>开启 DXVA/D3D11VA，降低 CPU 占用</td></tr>
+<tr><td>基本</td><td>记忆播放位置</td><td>开启（OpenList 不记进度，靠 PotPlayer 补）</td></tr>
+</table>
+<p class="muted">不同 PotPlayer 版本菜单位置略有差异，认准关键词“缓存 / 缓冲”。</p>
+</div></div>
+
+<h2>③ 方案 B：rclone 挂载成盘符（要“双击就播”再做）</h2>
+
+<h3>B-1. 安装两个组件</h3>
+<pre><code>winget install WinFsp.WinFsp
+winget install Rclone.Rclone
+:: 装完 WinFsp 建议重启一次；rclone 要新开终端才进 PATH</code></pre>
+
+<h3>B-2. 一键挂载（我已写好脚本）</h3>
+<pre><code>cd /d "%USERPROFILE%\quark-potplayer\scripts"
+:: 先编辑 config.ps1 里的 OpenListUser / OpenListPass
+powershell -NoProfile -ExecutionPolicy Bypass -File mount-quark.ps1</code></pre>
+<p>脚本会自动创建 rclone remote（<code>openlist</code> → WebDAV <code>http://127.0.0.1:5244/dav</code>）并挂载 <code>openlist:/quark</code> 到 <b>Z:</b>。关键参数及理由：</p>
+<table>
+<tr><th>参数</th><th>值</th><th>为什么</th></tr>
+<tr><td><code>--vfs-cache-mode writes</code></td><td>writes</td><td>支持随机 seek（拖进度条），比 minimal 顺滑；只缓存读过的片段，不会整片下载</td></tr>
+<tr><td><code>--vfs-read-chunk-size</code></td><td>32M（上限 1G）</td><td>首块小=起播快，后续块翻倍=高码率跟得上</td></tr>
+<tr><td><code>--buffer-size</code></td><td>64M</td><td>内存预读，扛网络抖动</td></tr>
+<tr><td><code>--dir-cache-time</code></td><td>15s</td><td>新文件 15 秒内出现在盘里</td></tr>
+<tr><td><code>--vfs-cache-max-size / max-age</code></td><td>20G / 6h</td><td>限制缓存占盘，自动清理</td></tr>
+</table>
+<p>挂好后：资源管理器打开 <code>Z:\</code> → 双击任意视频 = PotPlayer 直接开播；<b>同名 srt/ass 字幕放在同一文件夹会自动加载</b>。</p>
+
+<h3>B-3. 开机自动挂载</h3>
+<div class="step"><div class="n">1</div><div>按 <span class="kbd">Win+R</span> → 输入 <code>shell:startup</code> → 回车。</div></div>
+<div class="step"><div class="n">2</div><div>把 <code>scripts\mount-autostart.bat</code> 的<b>快捷方式</b>放进去。这样开机后 Z: 盘直接可用，双击即播。（OpenList 无需开机自启：QuarkPlay 桌面应用打开时会自动拉起服务。）</div></div>
+
+<h2>④ 方案 C：CloudDrive2（不想碰命令行）</h2>
+<p>官网 <a href="http://www.clouddrive2.com">clouddrive2.com</a> 下载 Windows 版 → 注册 → 添加云存储 → 选<b>夸克网盘</b> → 粘贴网页版 Cookie → 挂载为盘符。之后和方案 B 的使用体验一致（双击即播、字幕自动加载）。它自带 WebDAV 服务（<code>http://127.0.0.1:19798</code>），还能反哺给电视/手机播放器用。完整功能需订阅，价格以官网为准。</p>
+
+<h2>⑤ 自动化脚本包（已生成，配合方案 A/B 使用）</h2>
+<table>
+<tr><th>文件</th><th>作用</th></tr>
+<tr><td><code>scripts\config.ps1</code></td><td>唯一需要编辑的配置：OpenList 地址/账号、扫描目录、PotPlayer 路径</td></tr>
+<tr><td><code>scripts\watch-new.ps1</code></td><td>扫描网盘新增视频 → 自动生成 <code>new-videos.m3u</code> → 自动拉起 PotPlayer 播放</td></tr>
+<tr><td><code>scripts\mount-quark.ps1</code></td><td>rclone 挂载 Z: 盘（自动建 remote、缓存参数已调好）</td></tr>
+<tr><td><code>scripts\register-quarkplay.reg</code></td><td>注册 <code>quarkplay:</code> 协议（双击导入注册表）</td></tr>
+<tr><td><code>scripts\play-url.ps1 / .bat</code></td><td>协议后端：<code>quarkplay:/quark/电影/a.mkv</code> → 换算直链 → PotPlayer</td></tr>
+<tr><td><code>scripts\mount-autostart.bat</code></td><td>rclone 挂载的开机自启动器（可选，放 shell:startup）</td></tr>
+</table>
+
+<h3>5.1 监听网盘新增视频并自动播放</h3>
+<pre><code>cd /d "%USERPROFILE%\quark-potplayer\scripts"
+:: 一次性：扫最近 24h 的新视频，有就弹 PotPlayer
+powershell -NoProfile -ExecutionPolicy Bypass -File watch-new.ps1
+
+:: 常驻监听（每 60s 扫一次，Ctrl+C 停止）
+powershell -NoProfile -ExecutionPolicy Bypass -File watch-new.ps1 -Watch
+
+:: 自定义“新”的定义 / 只生成列表不开播
+powershell ... -File watch-new.ps1 -Hours 48
+powershell ... -File watch-new.ps1 -NoOpen</code></pre>
+<p class="muted">原理：调 OpenList API 递归列出 <code>config.ps1</code> 里 <code>$ScanDirs</code>（默认整个网盘，深度 4 层），对比本地已看记录（<code>seen-videos.txt</code>）+ 修改时间，新文件写进 m3u（自动携带签名参数）。扫描有节流（默认 60s 一轮），避免触发风控。</p>
+
+<h3>5.2 双击即播的两种形态</h3>
+<table>
+<tr><th>形态</th><th>做法</th><th>适合</th></tr>
+<tr><td><b>实体文件双击</b>（推荐）</td><td>先按方案 B 挂出 Z: 盘 → PotPlayer 按 F5 → 基本 → 关联 → 勾选 mkv/mp4/ts 等扩展名 → 应用。之后 Z 盘里双击就是 PotPlayer。</td><td>浏览、整理、选片</td></tr>
+<tr><td><b>协议链接双击</b></td><td>双击导入 <code>register-quarkplay.reg</code> → 之后任何地方出现 <code>quarkplay:/quark/路径/文件.mkv</code> 链接（浏览器、脚本、生成的 .url 快捷方式），点击即播。<b>前提：存储设置里关闭了“启用签名”。</b></td><td>未挂盘时用脚本/快捷方式直达</td></tr>
+</table>
+<p class="muted">例如给某部电影生成桌面快捷方式：右键桌面 → 新建快捷方式 → 位置填 <code>quarkplay:/quark/电影/沙丘2.mkv</code>，以后双击这个图标直接开播。</p>
+
+<h2>⑥ 适用条件与限制</h2>
+<h3>支持范围</h3>
+<table>
+<tr><th>项</th><th>说明</th></tr>
+<tr><td>网盘类型</td><td>本方案主打通配：OpenList 支持<b>夸克 / 阿里 / 百度 / 115 / 天翼 / 迅雷 / 123 等 30+</b> 网盘，加一个存储就多一个源；CloudDrive2 同理。换网盘不用换方案。</td></tr>
+<tr><td>账号</td><td>夸克非会员下载限速，边下边播 1080P 都会卡；<b>SVIP 才有实用价值</b>（你已是 SVIP ✔）</td></tr>
+<tr><td>文件格式</td><td>mkv/ts/m2ts 最适合流式播放（索引在头部，seek 快）；mp4 要求 moov 在文件头（faststart 封装），否则要等全片索引；蓝光原盘 BDMV 结构建议用方案 B 挂载后再播</td></tr>
+</table>
+
+<h3>带宽与清晰度（直链 302 = 直连夸克 CDN，SVIP 满速）</h3>
+<table>
+<tr><th>内容</th><th>所需稳定带宽</th><th>校园网可行性</th></tr>
+<tr><td>1080P H.264</td><td>8～12 Mbps（1～1.5 MB/s）</td><td>轻松 ✔</td></tr>
+<tr><td>1080P HEVC</td><td>4～8 Mbps</td><td>轻松 ✔</td></tr>
+<tr><td>4K HEVC / HDR</td><td>25～80 Mbps</td><td>看校园网出口，高峰期可能顶不住</td></tr>
+<tr><td>60～80G 蓝光原盘 remux</td><td>40～100 Mbps</td><td>建议挂载 + 大缓存，或先转码版观看</td></tr>
+</table>
+
+<h3>字幕</h3>
+<ul>
+<li><b>方案 B（挂载）</b>：srt/ass 与视频同名放同一网盘文件夹 → PotPlayer 自动加载 ✔（最省心）</li>
+<li><b>方案 A（直链）</b>：URL 播放不会自动找网络字幕 → 把 srt 从 OpenList 网页下载后拖进 PotPlayer 窗口即可；在线匹配字幕功能照常可用</li>
+</ul>
+
+<h2>⑦ 常见失败与排查</h2>
+<table>
+<tr><th>现象</th><th>原因</th><th>解决</th></tr>
+<tr><td>OpenList 存储状态不是 work / 列表为空</td><td>Cookie 失效或复制不全</td><td>重新 F12 抓完整 Cookie（注意要登录态下抓）；检查根文件夹 ID</td></tr>
+<tr><td>PotPlayer 打开直链报 401/403</td><td>①“启用签名”开着但链接没带 sign；②链接少了一级挂载路径（/d/ 后必须紧跟 /quark）</td><td>关掉签名（本机自用）；或改用 watch-new.ps1 生成的链接（自动带 sign 和完整路径）</td></tr>
+<tr><td>起播要等十几秒</td><td>mp4 的 moov 在尾部，或首块太大</td><td>换 mkv/ts 源；或把 <code>--vfs-read-chunk-size</code> 降到 16M</td></tr>
+<tr><td>拖进度条黑屏很久 / 卡死</td><td>缓存模式或缓冲不够</td><td>确认 <code>--vfs-cache-mode writes</code>；PotPlayer 文件/流缓存调到 512M+</td></tr>
+<tr><td>4K 频繁缓冲</td><td>带宽不够或走了本地代理</td><td>确认存储用的是 302 直链不是“Web 代理”；关掉“使用转码地址”外的多余代理；或降清晰度</td></tr>
+<tr><td>rclone 报 <code>mount: error: WinFsp not found</code></td><td>WinFsp 没装或没重启</td><td><code>winget install WinFsp.WinFsp</code> 后重启电脑</td></tr>
+<tr><td>Z: 盘看不见</td><td>rclone 退出了 / OpenList 没在跑</td><td>先开 OpenList（5244 能访问），再跑 mount-quark.ps1</td></tr>
+<tr><td>watch-new.ps1 报 Login failed</td><td>config.ps1 密码不对</td><td>改成 <code>openlist admin set</code> 设置的密码</td></tr>
+<tr><td>Cookie 过期（几天到几周不等）</td><td>夸克服务端会话失效</td><td>重新抓 Cookie 更新；这是第三方方案的固有代价</td></tr>
+<tr><td>突然全部 429 / 接口报错</td><td>触发夸克风控（请求太频繁）</td><td>调大 <code>$PollSeconds</code>、缩小 <code>$ScanDirs</code> 范围、少开并发；停几小时再试</td></tr>
+<tr><td>某天驱动整体失效</td><td>夸克改了接口</td><td>升级 OpenList（GitHub releases）或 CloudDrive2；社区通常几天内适配</td></tr>
+</table>
+
+<div class="box okbox">
+<b>✔ 建议落地顺序</b><br>
+① 装 OpenList + 加夸克存储（10 分钟）→ ② PotPlayer 打开一条直链验证边下边播 → ③ 导入 <code>watch-new.ps1</code> 自动追更 →
+④ 想要双击体验再装 WinFsp+rclone 挂 Z: 盘并设自启。全程免费，付费只有 CloudDrive2 这一个可选项。
+</div>
+
+<div class="foot">脚本位于 <code>quark-potplayer\scripts\</code> · 生成于 2026-09-19 · Cookie 属于账号级敏感凭据，不要外传或提交到任何仓库</div>
+
+</div>
+</body>
+</html>
